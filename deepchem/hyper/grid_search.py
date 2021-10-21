@@ -2,6 +2,7 @@
 Contains basic hyperparameter optimizations.
 """
 import numpy as np
+import tensorflow as tf
 import os
 import itertools
 import tempfile
@@ -10,11 +11,14 @@ import collections
 import logging
 from functools import reduce
 from operator import mul
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
+import deepchem
 
 from deepchem.data import Dataset
+from deepchem.models.models import Model
 from deepchem.trans import Transformer
 from deepchem.metrics import Metric
+from deepchem.models import ValidationCallback, callbacks
 from deepchem.hyper.base_classes import HyperparamOpt
 from deepchem.hyper.base_classes import _convert_hyperparam_dict_to_filename
 
@@ -68,6 +72,10 @@ class GridHyperparamOpt(HyperparamOpt):
       output_transformers: List[Transformer] = [],
       nb_epoch: int = 10,
       use_max: bool = True,
+      replicates: int = 1,
+      rng_seeds: Optional[List[int]] = None,
+      restore_best_checkpoint: bool = False,
+      checkpoint_interval: int = 10,
       logdir: Optional[str] = None,
       **kwargs,
   ):
@@ -98,9 +106,22 @@ class GridHyperparamOpt(HyperparamOpt):
     use_max: bool, optional
       If True, return the model with the highest score. Else return
       model with the minimum score.
+    replicates: int, optional
+      How many times to evaluate each hyperparameter combination (for variance estimation)
+    rng_seeds: list[int], optional
+      If provided, will set the global rng seeds of numpy and tf prior to training each 
+      model replicate. Must be the same size as the number of replicates and all the
+      elements must be unique! Used for getting reproducible results.
+    restore_best_checkpoint: bool, optional
+      Restores the model from the best checkpoint achieved during the training run for final
+      evaluation
+    checkpoint_interval: int, optional
+      Used only if restore_best_checkpoint is set to True. Determines the frequency at which
+      checkpoints are created when using the validation callback.
     logdir: str, optional
       The directory in which to store created models. If not set, will
       use a temporary directory.
+    kwargs: remaining kwargs are passed to the .fit() method of the estimator
 
     Returns
     -------
@@ -108,14 +129,21 @@ class GridHyperparamOpt(HyperparamOpt):
       `(best_model, best_hyperparams, all_scores)` where `best_model` is
       an instance of `dc.model.Model`, `best_hyperparams` is a
       dictionary of parameters, and `all_scores` is a dictionary mapping
-      string representations of hyperparameter sets to validation
+      string representations of hyperparameter sets to lists of validation
       scores.
     """
+    # check argument validities
     hyperparams = params_dict.keys()
     hyperparam_vals = params_dict.values()
     for hyperparam_list in params_dict.values():
       assert isinstance(hyperparam_list, collections.abc.Iterable)
-
+    assert isinstance(replicates, int) and replicates > 0, "replicates must be a positive integer"
+    if rng_seeds is not None:
+      assert isinstance(rng_seeds, Iterable) and len(rng_seeds) == replicates
+      for seed in rng_seeds:
+        assert isinstance(seed, int) and seed >= 0, "rng seed must be a non-negative integer"
+      assert len(set(rng_seeds)) == replicates, "all rng seeds must be unique"
+    
     number_combinations = reduce(mul, [len(vals) for vals in hyperparam_vals])
 
     if use_max:
@@ -123,72 +151,153 @@ class GridHyperparamOpt(HyperparamOpt):
     else:
       best_validation_score = np.inf
     best_hyperparams = None
-    best_model, best_model_dir = None, None
     all_scores = {}
-    for ind, hyperparameter_tuple in enumerate(
-        itertools.product(*hyperparam_vals)):
-      model_params = {}
+    
+    # set training kwargs used by all models
+    train_kwargs = {
+      "valid_dataset": valid_dataset,
+      "metric": metric,
+      "output_transformers": output_transformers,
+      "nb_epoch": nb_epoch,
+      "use_max": use_max,
+      "restore_best_checkpoint": restore_best_checkpoint,
+      "checkpoint_interval": checkpoint_interval
+    }
+    # loop through HPs, build and test models
+    for ind, hyperparameter_tuple in enumerate(itertools.product(*hyperparam_vals)):
       logger.info("Fitting model %d/%d" % (ind + 1, number_combinations))
+      model_dir = self.create_model_dir(logdir=logdir)
       # Construction dictionary mapping hyperparameter names to values
-      hyper_params = dict(zip(hyperparams, hyperparameter_tuple))
-      for hyperparam, hyperparam_val in zip(hyperparams, hyperparameter_tuple):
-        model_params[hyperparam] = hyperparam_val
+      model_params = self.build_model_params_dict(hyperparams, hyperparameter_tuple)
       logger.info("hyperparameters: %s" % str(model_params))
-
-      if logdir is not None:
-        model_dir = os.path.join(logdir, str(ind))
-        logger.info("model_dir is %s" % model_dir)
-        try:
-          os.makedirs(model_dir)
-        except OSError:
-          if not os.path.isdir(model_dir):
-            logger.info("Error creating model_dir, using tempfile directory")
-            model_dir = tempfile.mkdtemp()
-      else:
-        model_dir = tempfile.mkdtemp()
+      # set model directory
       model_params['model_dir'] = model_dir
-      model = self.model_builder(**model_params)
-      # mypy test throws error, so ignoring it in try
-      try:
-        model.fit(train_dataset, nb_epoch=nb_epoch)  # type: ignore
-      # Not all models have nb_epoch
-      except TypeError:
-        model.fit(train_dataset)
-      try:
-        model.save()
-      # Some models autosave
-      except NotImplementedError:
-        pass
-
-      multitask_scores = model.evaluate(valid_dataset, [metric],
-                                        output_transformers)
-      valid_score = multitask_scores[metric.name]
+      
+      # build and evaluate model replicates
+      hyper_params = dict(zip(hyperparams, hyperparameter_tuple))
       hp_str = _convert_hyperparam_dict_to_filename(hyper_params)
-      all_scores[hp_str] = valid_score
+      valid_scores = []
+      for i in range(replicates):
+        logger.info("Fitting replicate %i" % (i + 1))
+        # check for rng seeds and set
+        if rng_seeds is not None:
+          rng_seed = rng_seeds[i]
+        else:
+          rng_seed = None
+        # build and train a model
+        model = self.train_model(model_params, train_dataset, rng_seed=rng_seed, **train_kwargs)
+        # evaluate trained model
+        multitask_scores = model.evaluate(valid_dataset, [metric],
+                                          output_transformers)
+        valid_scores.append(multitask_scores[metric.name])
 
-      if (use_max and valid_score >= best_validation_score) or (
-          not use_max and valid_score <= best_validation_score):
-        best_validation_score = valid_score
+      all_scores[hp_str] = valid_scores
+      mean_val_score = np.mean(valid_scores)
+      if (use_max and mean_val_score >= best_validation_score) or (
+          not use_max and mean_val_score <= best_validation_score):
+        best_validation_score = mean_val_score
         best_hyperparams = hyperparameter_tuple
-        if best_model_dir is not None:
-          shutil.rmtree(best_model_dir)
-        best_model_dir = model_dir
-        best_model = model
-      else:
-        shutil.rmtree(model_dir)
+        # if best_model_dir is not None:
+        #   shutil.rmtree(best_model_dir)
+        # best_model_dir = model_dir
+        # best_model = model
+      # else:
+      #   shutil.rmtree(model_dir)
 
       logger.info("Model %d/%d, Metric %s, Validation set %s: %f" %
-                  (ind + 1, number_combinations, metric.name, ind, valid_score))
+                  (ind + 1, number_combinations, metric.name, ind, mean_val_score))
       logger.info("\tbest_validation_score so far: %f" % best_validation_score)
-    if best_model is None:
-      logger.info("No models trained correctly.")
-      # arbitrarily return last model
-      best_model, best_hyperparams = model, hyperparameter_tuple
+      # clean up: remove model dir
+      shutil.rmtree(model_dir)
+
+    if best_hyperparams is not None:
+      # retrain best model
+      logging.info("Re-training best model: %s" % str(best_hyperparams))
+      model_dir = self.create_model_dir(logdir=logdir)
+      model_params = self.build_model_params_dict(hyperparams, hyperparameter_tuple)
+      model_params['model_dir'] = model_dir
+      rng_seed = rng_seeds[0] if rng_seeds is not None else None
+      best_model = self.train_model(model_params, train_dataset, rng_seed=rng_seed, **train_kwargs)
+      # evaluate best model
+      train_scores = best_model.evaluate(train_dataset, [metric],
+                                            output_transformers)
+      train_score = train_scores[metric.name]
+      valid_scores = best_model.evaluate(valid_dataset, [metric],
+                                            output_transformers)
+      valid_score = valid_scores[metric.name]
+      logger.info("Best hyperparameters: %s" % str(best_hyperparams))
+      logger.info("train_score: %f" % train_score)
+      logger.info("validation_score: %f" % valid_score)
+      # clean up: remove model dir
+      shutil.rmtree(model_dir)
       return best_model, best_hyperparams, all_scores
-    multitask_scores = best_model.evaluate(train_dataset, [metric],
-                                           output_transformers)
-    train_score = multitask_scores[metric.name]
-    logger.info("Best hyperparameters: %s" % str(best_hyperparams))
-    logger.info("train_score: %f" % train_score)
-    logger.info("validation_score: %f" % best_validation_score)
-    return best_model, best_hyperparams, all_scores
+    else:
+      logging.warning("Failed to sucessfully train any models")
+      return None, None, None
+
+  @staticmethod
+  def create_model_dir(logdir:str=None) -> str:
+    if logdir is not None:
+      # model_dir = os.path.join(logdir, str(ind))
+      model_dir = logdir
+      logger.info("model_dir is %s" % model_dir)
+      try:
+        os.makedirs(model_dir)
+      except OSError:
+        if not os.path.isdir(model_dir):
+          logger.info("Error creating model_dir, using tempfile directory")
+          model_dir = tempfile.mkdtemp()
+    else:
+      model_dir = tempfile.mkdtemp()
+    return model_dir
+
+  @staticmethod
+  def build_model_params_dict(hyperparams: Iterable, hyperparameter_tuple: Iterable) -> dict:
+    model_params = {}
+    for hyperparam, hyperparam_val in zip(hyperparams, hyperparameter_tuple):
+      model_params[hyperparam] = hyperparam_val
+    return model_params
+
+  def train_model(self, model_params:dict, train_dataset:Dataset, rng_seed:int=None, 
+    restore_best_checkpoint:bool=False, valid_dataset:Dataset=None, checkpoint_interval:int=10,
+    metric:Metric=None, use_max:bool=True, nb_epoch:int=10,
+    output_transformers=[]) -> Model:
+    """Build and train a single model"""
+    if rng_seed is not None:
+      np.random.seed(rng_seed)
+      tf.random.set_seed(rng_seed)
+      # TODO: set pytorch rng seed as well!
+
+    if restore_best_checkpoint:
+      val_dir = tempfile.mkdtemp()
+      val_callback = ValidationCallback(valid_dataset, checkpoint_interval, [metric], save_dir=val_dir, 
+        save_on_minimum=(not use_max), transformers=output_transformers)
+    else:
+      val_dir, val_callback = None, []
+
+    # build and train the model
+    model = self.model_builder(**model_params)
+    # mypy test throws error, so ignoring it in try
+    try:
+      model.fit(train_dataset, nb_epoch=nb_epoch, callbacks=val_callback)  # type: ignore
+    # Not all models have nb_epoch or callbacks
+    except TypeError:
+      model.fit(train_dataset)
+    try:
+      model.save()
+    # Some models autosave
+    except NotImplementedError:
+      pass
+    # for models with checkpointing, restore the latest (best) checkpoint if enabled
+    if restore_best_checkpoint:
+      try:
+        model.restore(model_dir=val_dir)
+      except NotImplementedError:
+        logger.warning("Could not restore model weights from validation checkpoint. \
+          Using latest weights instead")
+        pass
+    # clean up: remove validation dir if used
+    if (val_dir is not None) and os.path.exists(val_dir):
+      shutil.rmtree(val_dir)
+    return model
+
