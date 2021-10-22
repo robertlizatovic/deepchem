@@ -139,7 +139,8 @@ class GridHyperparamOpt(HyperparamOpt):
       assert isinstance(hyperparam_list, collections.abc.Iterable)
     assert isinstance(replicates, int) and replicates > 0, "replicates must be a positive integer"
     if rng_seeds is not None:
-      assert isinstance(rng_seeds, Iterable) and len(rng_seeds) == replicates
+      assert isinstance(rng_seeds, Iterable) and len(rng_seeds) == replicates, "number of passed rng seeds must be \
+        equal to the number of replicates"
       for seed in rng_seeds:
         assert isinstance(seed, int) and seed >= 0, "rng seed must be a non-negative integer"
       assert len(set(rng_seeds)) == replicates, "all rng seeds must be unique"
@@ -180,10 +181,7 @@ class GridHyperparamOpt(HyperparamOpt):
       for i in range(replicates):
         logger.info("Fitting replicate %i" % (i + 1))
         # check for rng seeds and set
-        if rng_seeds is not None:
-          rng_seed = rng_seeds[i]
-        else:
-          rng_seed = None
+        rng_seed = rng_seeds[i] if rng_seeds is not None else None
         # build and train a model
         model = self.train_model(model_params, train_dataset, rng_seed=rng_seed, **train_kwargs)
         # evaluate trained model
@@ -197,13 +195,6 @@ class GridHyperparamOpt(HyperparamOpt):
           not use_max and mean_val_score <= best_validation_score):
         best_validation_score = mean_val_score
         best_hyperparams = hyperparameter_tuple
-        # if best_model_dir is not None:
-        #   shutil.rmtree(best_model_dir)
-        # best_model_dir = model_dir
-        # best_model = model
-      # else:
-      #   shutil.rmtree(model_dir)
-
       logger.info("Model %d/%d, Metric %s, Validation set %s: %f" %
                   (ind + 1, number_combinations, metric.name, ind, mean_val_score))
       logger.info("\tbest_validation_score so far: %f" % best_validation_score)
@@ -212,9 +203,9 @@ class GridHyperparamOpt(HyperparamOpt):
 
     if best_hyperparams is not None:
       # retrain best model
-      logging.info("Re-training best model: %s" % str(best_hyperparams))
+      logger.info("Re-training best model: %s" % str(best_hyperparams))
       model_dir = self.create_model_dir(logdir=logdir)
-      model_params = self.build_model_params_dict(hyperparams, hyperparameter_tuple)
+      model_params = self.build_model_params_dict(hyperparams, best_hyperparams)
       model_params['model_dir'] = model_dir
       rng_seed = rng_seeds[0] if rng_seeds is not None else None
       best_model = self.train_model(model_params, train_dataset, rng_seed=rng_seed, **train_kwargs)
