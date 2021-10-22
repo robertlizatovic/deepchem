@@ -257,7 +257,11 @@ class GridHyperparamOpt(HyperparamOpt):
     if rng_seed is not None:
       np.random.seed(rng_seed)
       tf.random.set_seed(rng_seed)
-      # TODO: set pytorch rng seed as well!
+      try:
+        import torch
+        torch.manual_seed(rng_seed)
+      except ImportError:
+        pass
 
     if restore_best_checkpoint:
       val_dir = tempfile.mkdtemp()
