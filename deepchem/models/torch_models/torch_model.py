@@ -454,6 +454,8 @@ class TorchModel(Model):
         self.save_checkpoint(max_checkpoints_to_keep)
       for c in callbacks:
         c(self, current_step)
+      # put back into training mode
+      self.model.train()
       if self.tensorboard and should_log:
         self._log_scalar_to_tensorboard('loss', batch_loss, current_step)
       if (self.wandb_logger is not None) and should_log:
