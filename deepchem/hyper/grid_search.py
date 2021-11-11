@@ -185,8 +185,8 @@ class GridHyperparamOpt(HyperparamOpt):
         # build and train a model
         model = self.train_model(model_params, train_dataset, rng_seed=rng_seed, **train_kwargs)
         # evaluate trained model
-        multitask_scores = model.evaluate(valid_dataset, [metric],
-                                          output_transformers)
+        multitask_scores = model.evaluate(valid_dataset, [metric], output_transformers,
+          use_sample_weights=True)
         valid_scores.append(multitask_scores[metric.name])
 
       all_scores[hp_str] = valid_scores
@@ -266,7 +266,7 @@ class GridHyperparamOpt(HyperparamOpt):
     if restore_best_checkpoint:
       val_dir = tempfile.mkdtemp()
       val_callback = ValidationCallback(valid_dataset, checkpoint_interval, [metric], save_dir=val_dir, 
-        save_on_minimum=(not use_max), transformers=output_transformers)
+        save_on_minimum=(not use_max), transformers=output_transformers, use_sample_weights=True)
     else:
       val_dir, val_callback = None, []
 
