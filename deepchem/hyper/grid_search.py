@@ -210,11 +210,11 @@ class GridHyperparamOpt(HyperparamOpt):
       rng_seed = rng_seeds[0] if rng_seeds is not None else None
       best_model = self.train_model(model_params, train_dataset, rng_seed=rng_seed, **train_kwargs)
       # evaluate best model
-      train_scores = best_model.evaluate(train_dataset, [metric],
-                                            output_transformers)
+      train_scores = best_model.evaluate(train_dataset, [metric], output_transformers, 
+        use_sample_weights=True)
       train_score = train_scores[metric.name]
-      valid_scores = best_model.evaluate(valid_dataset, [metric],
-                                            output_transformers)
+      valid_scores = best_model.evaluate(valid_dataset, [metric], output_transformers, 
+        use_sample_weights=True)
       valid_score = valid_scores[metric.name]
       logger.info("Best hyperparameters: %s" % str(best_hyperparams))
       logger.info("train_score: %f" % train_score)
