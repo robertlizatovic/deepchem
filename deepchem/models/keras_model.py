@@ -313,7 +313,8 @@ class KerasModel(Model):
           variables: Optional[List[tf.Variable]] = None,
           loss: Optional[LossFn] = None,
           callbacks: Union[Callable, List[Callable]] = [],
-          all_losses: Optional[List[float]] = None) -> float:
+          all_losses: Optional[List[float]] = None, 
+          training: bool = True) -> float:
     """Train this model on a dataset.
 
     Parameters
@@ -356,7 +357,7 @@ class KerasModel(Model):
         self.default_generator(
             dataset, epochs=nb_epoch,
             deterministic=deterministic), max_checkpoints_to_keep,
-        checkpoint_interval, restore, variables, loss, callbacks, all_losses)
+        checkpoint_interval, restore, variables, loss, callbacks, all_losses, training=training)
 
   def fit_generator(self,
                     generator: Iterable[Tuple[Any, Any, Any]],
@@ -366,7 +367,8 @@ class KerasModel(Model):
                     variables: Optional[List[tf.Variable]] = None,
                     loss: Optional[LossFn] = None,
                     callbacks: Union[Callable, List[Callable]] = [],
-                    all_losses: Optional[List[float]] = None) -> float:
+                    all_losses: Optional[List[float]] = None, 
+                    training: bool = True) -> float:
     """Train this model on data from a generator.
 
     Parameters
@@ -441,7 +443,7 @@ class KerasModel(Model):
       if len(inputs) == 1:
         inputs = inputs[0]
 
-      batch_loss = apply_gradient_for_batch(inputs, labels, weights, loss)
+      batch_loss = apply_gradient_for_batch(inputs, labels, weights, loss, training=training)
       current_step = self._global_step.numpy()
 
       avg_loss += batch_loss
@@ -495,9 +497,9 @@ class KerasModel(Model):
     """
 
     @tf.function(experimental_relax_shapes=True)
-    def apply_gradient_for_batch(inputs, labels, weights, loss):
+    def apply_gradient_for_batch(inputs, labels, weights, loss, training=True):
       with tf.GradientTape() as tape:
-        outputs = self.model(inputs, training=True)
+        outputs = self.model(inputs, training=training)
         if tf.is_tensor(outputs):
           outputs = [outputs]
         if self._loss_outputs is not None:
