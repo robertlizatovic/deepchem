@@ -891,8 +891,8 @@ class _GraphConvKerasModel2(tf.keras.Model):
   def __init__(self,
                n_tasks,
                graph_conv_layers,
-               fc_layers=[128],
-               task_layer_size=128,
+               fc_layers=[],
+               task_layer_size=None,
                dense_layer_size=128,
                dropout=0.0,
                mode="classification",
@@ -920,7 +920,10 @@ class _GraphConvKerasModel2(tf.keras.Model):
     self.uncertainty = uncertainty
 
     # ceate a list of dropout probs for all DP layers
-    num_dp_bn = len(graph_conv_layers) + 1 + len(fc_layers) + n_tasks
+    if task_layer_size is not None:
+      num_dp_bn = len(graph_conv_layers) + 1 + len(fc_layers) + n_tasks
+    else:
+      num_dp_bn = len(graph_conv_layers) + 1 + len(fc_layers)
     if not isinstance(dropout, SequenceCollection):
       dropout = [dropout] * num_dp_bn
     if len(dropout) !=  num_dp_bn:
@@ -954,21 +957,33 @@ class _GraphConvKerasModel2(tf.keras.Model):
       self.fc_concat = Concatenate() # for adding external input
     self.fc_layers = [Dense(layer_size, activation=tf.nn.relu) for layer_size in fc_layers]
     
-    # task-specific layers
-    self.task_layers = [Dense(task_layer_size, activation=tf.nn.relu) for _ in range(n_tasks)]
-    self.task_concat = Concatenate() # for combining all task outputs
-    
     # output layers
-    if self.mode == 'classification':
-      self.out_layers = [Dense(n_classes) for _ in range(n_tasks)]
-      self.reshape = Reshape((n_tasks, n_classes))
-      self.softmax = Softmax()
+    if task_layer_size is not None:
+      # using task-specific layers
+      self.task_layers = [Dense(task_layer_size, activation=tf.nn.relu) for _ in range(n_tasks)]
+      self.task_concat = Concatenate() # for combining all task outputs
+      if self.mode == 'classification':
+        self.out_layers = [Dense(n_classes) for _ in range(n_tasks)]
+        self.reshape = Reshape((n_tasks, n_classes))
+        self.softmax = Softmax()
+      else:
+        self.out_layers = [Dense(1) for _ in range(n_tasks)]
+        if self.uncertainty:
+          self.uncertainty_dense = [Dense(1) for _ in range(n_tasks)]
+          self.uncertainty_concat = Concatenate()
+          self.uncertainty_activation = Activation(tf.exp)
     else:
-      self.out_layers = [Dense(1) for _ in range(n_tasks)]
-      if self.uncertainty:
-        self.uncertainty_dense = [Dense(1) for _ in range(n_tasks)]
-        self.uncertainty_concat = Concatenate()
-        self.uncertainty_activation = Activation(tf.exp)
+      # using a single shared task layer 
+      self.task_layers = None
+      if self.mode == 'classification':
+        self.out_layer = Dense(n_tasks * n_classes)
+        self.reshape = Reshape((n_tasks, n_classes))
+        self.softmax = Softmax()
+      else:
+        self.out_layer = Dense(n_tasks)
+        if self.uncertainty:
+          self.uncertainty_dense = Dense(n_tasks)
+          self.uncertainty_activation = Activation(tf.exp)
 
   def call(self, inputs, training=False):
     # add an additional input for external molecule level features if specified
@@ -1028,35 +1043,50 @@ class _GraphConvKerasModel2(tf.keras.Model):
       dp_idx +=1
     fc_out = fc_in
 
-    # produce task outputs
-    task_outputs = []
-    log_vars = []
-    for i in range(len(self.task_layers)):
-      # apply task-specific layers
-      task_hidden = self.task_layers[i](fc_out)
-      if self.batch_norms[bn_idx] is not None:
-        task_hidden = self.batch_norms[bn_idx](task_hidden, training=training)
-      bn_idx += 1
-      if self.dropouts[dp_idx] is not None:
-        task_hidden = self.dropouts[dp_idx](task_hidden, training=training)
-      dp_idx +=1
-      if self.mode == "regression" and self.uncertainty:
-        # add variance estimates
-        log_vars.append(self.uncertainty_dense[i](task_hidden))
-      task_output = self.out_layers[i](task_hidden)
-      task_outputs.append(task_output)
-    output = self.task_concat(task_outputs)
-    if self.mode == 'classification':
-      logits = self.reshape(output)
-      output = self.softmax(logits)
-      outputs = [output, logits, fc_out]
-    else:
-      if self.uncertainty:
-        log_var = self.uncertainty_concat(log_vars)
-        var = self.uncertainty_activation(log_var)
-        outputs = [output, var, output, log_var, fc_out]
+    if self.task_layers is not None:
+      # apply task-specific layers and collect outputs
+      task_outputs = []
+      log_vars = []
+      for i in range(len(self.task_layers)):
+        task_hidden = self.task_layers[i](fc_out)
+        if self.batch_norms[bn_idx] is not None:
+          task_hidden = self.batch_norms[bn_idx](task_hidden, training=training)
+        bn_idx += 1
+        if self.dropouts[dp_idx] is not None:
+          task_hidden = self.dropouts[dp_idx](task_hidden, training=training)
+        dp_idx +=1
+        if self.mode == "regression" and self.uncertainty:
+          # add variance estimates
+          log_vars.append(self.uncertainty_dense[i](task_hidden))
+        task_output = self.out_layers[i](task_hidden)
+        task_outputs.append(task_output)
+      output = self.task_concat(task_outputs)
+      # produce outputs
+      if self.mode == 'classification':
+        logits = self.reshape(output)
+        output = self.softmax(logits)
+        outputs = [output, logits, fc_out]
       else:
-        outputs = [output, fc_out]
+        if self.uncertainty:
+          log_var = self.uncertainty_concat(log_vars)
+          var = self.uncertainty_activation(log_var)
+          outputs = [output, var, output, log_var, fc_out]
+        else:
+          outputs = [output, fc_out]
+    else:
+      # use the single shared layer to produce outputs
+      if self.mode == 'classification':
+        logits = self.reshape(self.out_layer(fc_out))
+        output = self.softmax(logits)
+        outputs = [output, logits, fc_out]
+      else:
+        output = self.out_layer(fc_out)
+        if self.uncertainty:
+          log_var = self.uncertainty_dense(fc_out)
+          var = self.uncertainty_activation(log_var)
+          outputs = [output, var, output, log_var, fc_out]
+        else:
+          outputs = [output, fc_out]
   
     return outputs
 
@@ -1213,8 +1243,8 @@ class GraphConvModel2(KerasModel):
                n_tasks: int,
                graph_conv_layers: List[int] = [64, 64],
                dense_layer_size: int = 128,
-               fc_layers: List[int] = [128],
-               task_layer_size: int = 128,
+               fc_layers: List[int] = [],
+               task_layer_size: int = None,
                dropout: float = 0.0,
                mode: str = "classification",
                number_atom_features: int = 75,
