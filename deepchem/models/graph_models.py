@@ -3,6 +3,7 @@ try:
 except:
   from collections import Sequence as SequenceCollection
 
+from tensorflow.python.keras.engine.base_layer import Layer
 import deepchem as dc
 import numpy as np
 import tensorflow as tf
@@ -918,38 +919,39 @@ class _GraphConvKerasModel2(tf.keras.Model):
     self.mode = mode
     self.use_external_features = use_external_features
     self.uncertainty = uncertainty
-
-    base_dp_bn = len(graph_conv_layers) + 1 + len(fc_layers)
-    task_dp_bn = n_tasks if task_layer_size is not None else 0
-    # if task_layer_size is not None:
-    #   num_dp_bn = len(graph_conv_layers) + 1 + len(fc_layers) + n_tasks
-    # else:
-    #   num_dp_bn = len(graph_conv_layers) + 1 + len(fc_layers)
-    # ceate a list of dropout probs for all DP layers
-    if not isinstance(dropout, SequenceCollection):
-      dropout = [dropout] * (base_dp_bn + task_dp_bn)
-    if len(dropout) != (base_dp_bn + task_dp_bn):
-      raise ValueError('Wrong number of dropout probabilities provided')
+    dropout = min(max(0.0, dropout), 1.0)
     if uncertainty:
       if mode != "regression":
         raise ValueError("Uncertainty is only supported in regression mode")
-      if any(d == 0.0 for d in dropout):
+      if dropout == 0.0:
         raise ValueError(
             'Dropout must be included in every layer to predict uncertainty')
 
-    self.graph_convs = [
-        layers.GraphConv(layer_size, activation_fn=tf.nn.relu)
-        for layer_size in graph_conv_layers
-    ]
-    self.base_batch_norms = [
-        BatchNormalization(fused=False) if batch_normalize else None
-        for _ in range(base_dp_bn)
-    ]
-    self.base_dropouts = [
-        Dropout(rate=rate) if rate > 0.0 else None for rate in dropout[:base_dp_bn]
-    ]
-    self.graph_pools = [layers.GraphPool() for _ in graph_conv_layers]
-    self.dense = Dense(dense_layer_size, activation=tf.nn.relu)
+    # create stacks of GC layers
+    gc_stacks = []
+    for layer_size in graph_conv_layers:
+      gc_stack = [layers.GraphConv(layer_size, activation_fn=tf.nn.relu)]
+      if batch_normalize:
+        gc_stack.append(BatchNormalization(fused=False))
+      else:
+        gc_stack.append(None)
+      if dropout > 0.0:
+        gc_stack.append(Dropout(rate=dropout))
+      else:
+        gc_stack.append(None)
+      gc_stack.append(layers.GraphPool())
+      gc_stacks.append(gc_stack)
+    self.gc_stacks = gc_stacks
+
+    # create a stack of dense layers
+    dense_stack = [Dense(dense_layer_size, activation=tf.nn.relu)]
+    if batch_normalize:
+      dense_stack.append(BatchNormalization(fused=False))
+    if dropout > 0.0:
+      dense_stack.append(Dropout(rate=dropout))
+    self.dense_stack = dense_stack
+
+    # global readout layers
     self.graph_gather = layers.GraphGather(
         batch_size=batch_size, activation_fn=tf.nn.tanh)
     self.trim = TrimGraphOutput()
@@ -957,19 +959,29 @@ class _GraphConvKerasModel2(tf.keras.Model):
     # FC layers (operate on the molecule-level representation)
     if self.use_external_features:
       self.fc_concat = Concatenate() # for adding external input
-    self.fc_layers = [Dense(layer_size, activation=tf.nn.relu) for layer_size in fc_layers]
-    
+    fc_stacks = []
+    for layer_size in fc_layers:
+      fc_stack = [Dense(layer_size, activation=tf.nn.relu)]
+      if batch_normalize:
+        fc_stack.append(BatchNormalization(fused=False))
+      if dropout > 0.0:
+        fc_stack.append(Dropout(rate=dropout))
+      fc_stacks.append(fc_stack)
+    self.fc_stacks = fc_stacks
+
     # output layers
     if task_layer_size is not None:
       # using task-specific layers
-      self.task_batch_norms = [
-          BatchNormalization(fused=False) if batch_normalize else None
-          for _ in range(task_dp_bn)
-      ]
-      self.task_dropouts = [
-          Dropout(rate=rate) if rate > 0.0 else None for rate in dropout[base_dp_bn:]
-      ]
-      self.task_layers = [Dense(task_layer_size, activation=tf.nn.relu) for _ in range(n_tasks)]
+      all_task_layers = []
+      for _ in range(n_tasks):
+        task_layers = [Dense(task_layer_size, activation=tf.nn.relu)]
+        if batch_normalize:
+          task_layers.append(BatchNormalization(fused=False))
+        if dropout > 0.0:
+          task_layers.append(Dropout(rate=dropout))
+        all_task_layers.append(task_layers)
+      self.task_layers = all_task_layers
+      
       self.task_concat = Concatenate() # for combining all task outputs
       if self.mode == 'classification':
         self.out_layers = [Dense(n_classes) for _ in range(n_tasks)]
@@ -1008,32 +1020,22 @@ class _GraphConvKerasModel2(tf.keras.Model):
     n_samples = tf.cast(inputs[input_idx + 3], dtype=tf.int32)
     deg_adjs = [tf.cast(deg_adj, dtype=tf.int32) for deg_adj in inputs[input_idx + 4:]]
 
-    # running layer idxs
-    dp_idx, bn_idx = 0, 0 
-
     # apply graph convolutions
-    in_layer = atom_features
-    for i in range(len(self.graph_convs)):
-      gc_in = [in_layer, degree_slice, membership] + deg_adjs
-      gc1 = self.graph_convs[i](gc_in)
-      if self.base_batch_norms[bn_idx] is not None:
-        gc1 = self.base_batch_norms[bn_idx](gc1, training=training)
-      bn_idx += 1
-      if self.base_dropouts[dp_idx] is not None:
-        gc1 = self.base_dropouts[dp_idx](gc1, training=training)
-      dp_idx += 1
-      gp_in = [gc1, degree_slice, membership] + deg_adjs
-      in_layer = self.graph_pools[i](gp_in)
+    hidden = atom_features
+    for gc_stack in self.gc_stacks:
+      gc_in = [hidden, degree_slice, membership] + deg_adjs
+      hidden = gc_stack[0](gc_in)
+      if gc_stack[1] is not None:
+        hidden = gc_stack[1](hidden, training=training)
+      if gc_stack[2] is not None:
+        hidden = gc_stack[2](hidden, training=training)
+      gp_in = [hidden, degree_slice, membership] + deg_adjs
+      hidden = gc_stack[3](gp_in)
     
     # create molecule-level representation
-    dense = self.dense(in_layer)
-    if self.base_batch_norms[bn_idx] is not None:
-      dense = self.base_batch_norms[bn_idx](dense, training=training)
-    bn_idx += 1
-    if self.base_dropouts[dp_idx] is not None:
-      dense = self.base_dropouts[dp_idx](dense, training=training)
-    dp_idx += 1
-    neural_fingerprint = self.graph_gather([dense, degree_slice, membership] +
+    for layer in self.dense_stack:
+      hidden = layer(hidden)
+    neural_fingerprint = self.graph_gather([hidden, degree_slice, membership] +
                                            deg_adjs)
     # concatenate with any external molecular features
     neural_fingerprint = self.trim([neural_fingerprint, n_samples]) # trim output
@@ -1041,27 +1043,19 @@ class _GraphConvKerasModel2(tf.keras.Model):
       neural_fingerprint = self.fc_concat([neural_fingerprint, mol_features])
     
     # apply FC layers on the molecular representation
-    fc_in = neural_fingerprint
-    for fc_layer in self.fc_layers:
-      fc_in = fc_layer(fc_in)
-      if self.base_batch_norms[bn_idx] is not None:
-        fc_in = self.base_batch_norms[bn_idx](fc_in, training=training)
-      bn_idx += 1
-      if self.base_dropouts[dp_idx] is not None:
-        fc_in = self.base_dropouts[dp_idx](fc_in, training=training)
-      dp_idx +=1
-    fc_out = fc_in
+    hidden = neural_fingerprint
+    for fc_stack in self.fc_stacks:
+      for layer in fc_stack:
+        hidden = layer(hidden)
 
     if self.task_layers is not None:
       # apply task-specific layers and collect outputs
       task_outputs = []
       log_vars = []
-      for i in range(len(self.task_layers)):
-        task_hidden = self.task_layers[i](fc_out)
-        if self.task_batch_norms[i] is not None:
-          task_hidden = self.task_batch_norms[i](task_hidden, training=training)
-        if self.task_dropouts[i] is not None:
-          task_hidden = self.task_dropouts[i](task_hidden, training=training)
+      for i, task_layers in enumerate(self.task_layers):
+        task_hidden = hidden
+        for layer in task_layers:
+          task_hidden = layer(task_hidden)
         if self.mode == "regression" and self.uncertainty:
           # add variance estimates
           log_vars.append(self.uncertainty_dense[i](task_hidden))
@@ -1072,28 +1066,28 @@ class _GraphConvKerasModel2(tf.keras.Model):
       if self.mode == 'classification':
         logits = self.reshape(output)
         output = self.softmax(logits)
-        outputs = [output, logits, fc_out]
+        outputs = [output, logits, hidden]
       else:
         if self.uncertainty:
           log_var = self.uncertainty_concat(log_vars)
           var = self.uncertainty_activation(log_var)
-          outputs = [output, var, output, log_var, fc_out]
+          outputs = [output, var, output, log_var, hidden]
         else:
-          outputs = [output, fc_out]
+          outputs = [output, hidden]
     else:
       # use the single shared layer to produce outputs
       if self.mode == 'classification':
-        logits = self.reshape(self.out_layer(fc_out))
+        logits = self.reshape(self.out_layer(hidden))
         output = self.softmax(logits)
-        outputs = [output, logits, fc_out]
+        outputs = [output, logits, hidden]
       else:
-        output = self.out_layer(fc_out)
+        output = self.out_layer(hidden)
         if self.uncertainty:
-          log_var = self.uncertainty_dense(fc_out)
+          log_var = self.uncertainty_dense(hidden)
           var = self.uncertainty_activation(log_var)
-          outputs = [output, var, output, log_var, fc_out]
+          outputs = [output, var, output, log_var, hidden]
         else:
-          outputs = [output, fc_out]
+          outputs = [output, hidden]
   
     return outputs
 
